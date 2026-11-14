@@ -1,0 +1,106 @@
+"""Domain configuration, surface element definitions, and color palettes."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Tuple
+
+
+@dataclass(frozen=True)
+class SurfaceClass:
+    """Metadata and visual styling for a classified Earth surface element."""
+
+    id: int
+    key: str
+    label: str
+    short_label: str
+    color_hex: str
+    rgba: Tuple[int, int, int, int]
+    radar_signature: str
+    description: str
+
+
+SURFACE_CLASSES: Dict[int, SurfaceClass] = {
+    0: SurfaceClass(
+        id=0,
+        key="background",
+        label="Bare Ground / Unclassified",
+        short_label="Bare Ground",
+        color_hex="#64748B",
+        rgba=(100, 116, 139, 0),  # Transparent on map so basemap stays visible
+        radar_signature="Low-to-moderate HH & HV depending on soil roughness",
+        description="Exposed soil, dry riverbeds, or background terrain without dominant cover.",
+    ),
+    1: SurfaceClass(
+        id=1,
+        key="water",
+        label="Water & Flood Extent",
+        short_label="Water",
+        color_hex="#0EA5E9",
+        rgba=(14, 165, 233, 215),
+        radar_signature="Very low HH (-15 to -23 dB) & HV (-22 to -28 dB) via specular reflection",
+        description="Open rivers, lakes, tidal channels, and floodwater acting as radar mirrors.",
+    ),
+    2: SurfaceClass(
+        id=2,
+        key="treeline",
+        label="Tree Lines & Forest Canopy",
+        short_label="Tree Lines",
+        color_hex="#22C55E",
+        rgba=(34, 197, 94, 210),
+        radar_signature="Strong HV (-9 to -14 dB) & moderate HH (-5 to -9 dB) via volume scattering",
+        description="Riparian tree belts, dense canopy, mangroves, and forest boundaries.",
+    ),
+    3: SurfaceClass(
+        id=3,
+        key="wetland",
+        label="Wetlands & Flooded Vegetation",
+        short_label="Wetlands",
+        color_hex="#14B8A6",
+        rgba=(20, 184, 166, 205),
+        radar_signature="High HH (-2 to -6 dB) with large HH-HV gap via trunk-water double-bounce",
+        description="Inundated marshes, flooded forests, and saturated riparian zones.",
+    ),
+    4: SurfaceClass(
+        id=4,
+        key="cropland",
+        label="Cropland & Soil Moisture",
+        short_label="Cropland",
+        color_hex="#EAB308",
+        rgba=(234, 179, 8, 180),
+        radar_signature="Moderate HH (-9 to -14 dB) rising with moisture; low-to-moderate HV",
+        description="Agricultural fields, pastureland, and moisture-retaining floodplains.",
+    ),
+    5: SurfaceClass(
+        id=5,
+        key="urban",
+        label="Urban & Infrastructure",
+        short_label="Urban",
+        color_hex="#F97316",
+        rgba=(249, 115, 22, 215),
+        radar_signature="Very bright HH (-3 to +3 dB) & high local texture via corner reflectors",
+        description="Buildings, levees, bridges, and built surfaces showing persistent double-bounce.",
+    ),
+}
+
+SELECTABLE_CLASSES = [c for cid, c in SURFACE_CLASSES.items() if cid != 0]
+CLASS_BY_KEY = {c.key: c for c in SURFACE_CLASSES.values()}
+
+# Change detection palette (relative to start of chosen timeframe)
+CHANGE_COLORS = {
+    "gained": (244, 63, 94, 225),      # #F43F5E — newly appeared element
+    "lost": (250, 204, 21, 225),       # #FACC15 — disappeared since baseline
+    "persisting": (56, 189, 248, 125), # #38BDF8 — unchanged presence
+}
+
+CHANGE_HEX = {
+    "gained": "#F43F5E",
+    "lost": "#FACC15",
+    "persisting": "#38BDF8",
+}
+
+BASEMAPS = {
+    "Esri Satellite Imagery": "Esri.WorldImagery",
+    "Esri Light Gray Canvas": "Esri.WorldGrayCanvas",
+    "OpenStreetMap": "OpenStreetMap",
+    "Esri Topographic": "Esri.WorldTopoMap",
+}

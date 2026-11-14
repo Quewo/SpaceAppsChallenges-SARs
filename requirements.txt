@@ -1,0 +1,28 @@
+# NISAR Wasserflaechen-/Flutkartierung - NASA Space Apps 2026
+# Installation (PowerShell, .venv aktiv):  pip install -r requirements.txt
+# Danach Versionen festhalten:             pip freeze > requirements.lock.txt
+
+# Datensuche und Download (ASF)
+asf_search
+
+# NISAR-HDF5 lesen und GeoTIFFs schreiben
+h5py
+rasterio
+
+# Vektordaten (Untersuchungsgebiet, Flutpolygone, GeoJSON)
+geopandas
+
+# Auswertung (dB, Otsu, Filter, Morphologie)
+numpy
+scikit-image
+
+# Visualisierung
+matplotlib
+folium
+
+# Notebooks
+jupyterlab
+
+# Interaktive App
+streamlit
+streamlit-folium

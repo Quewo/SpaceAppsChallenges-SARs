@@ -2,11 +2,16 @@
 # Installation (PowerShell, .venv aktiv):  pip install -r requirements.txt
 # Danach Versionen festhalten:             pip freeze > requirements.lock.txt
 
-# Datensuche und Download (ASF)
+# Datensuche und Download (ASF & Earthdata)
 asf_search
+earthaccess
 
-# NISAR-HDF5 lesen und GeoTIFFs schreiben
+# NISAR-HDF5 / COG / Multi-Temporal Cubes lesen und schreiben
 h5py
+h5netcdf
+xarray
+rioxarray
+dask
 rasterio
 
 # Vektordaten (Untersuchungsgebiet, Flutpolygone, GeoJSON)

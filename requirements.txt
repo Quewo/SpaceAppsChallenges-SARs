@@ -26,3 +26,5 @@ jupyterlab
 # Interaktive App
 streamlit
 streamlit-folium
+
+nbstripout

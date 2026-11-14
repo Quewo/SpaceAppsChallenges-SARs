@@ -1,6 +1,7 @@
 """End-to-end verification tests for database, neural network classifier, pipeline, and Streamlit app."""
 from __future__ import annotations
 
+import base64
 import sys
 import tempfile
 import unittest
@@ -16,11 +17,14 @@ from src.classifier import SARNeuralNetClassifier, train_reference_sar_mlp
 from src.database import (
     clear_classifications,
     get_database_stats,
+    get_layer_grids_for_region,
+    import_processed_run_to_db,
     init_database,
     insert_sar_scene,
     list_region_dates,
     list_regions,
 )
+from src.earthdata_pipeline import list_processed_runs
 from src.flood import otsu_water_mask
 from src.map_builder import (
     build_base_map,
@@ -31,7 +35,9 @@ from src.pipeline import (
     build_rgba_overlay,
     compute_change_summary,
     compute_transition_rows,
+    encode_bundle_for_frontend,
     extract_hotspot_markers,
+    run_aoi_timeframe_pipeline,
     run_timeframe_pipeline,
 )
 
@@ -165,6 +171,283 @@ class SARBackendTests(unittest.TestCase):
 
         cleared = clear_classifications(region_id="amazon_deforestation", db_path=self.db_path)
         self.assertGreaterEqual(cleared, 8)
+
+    def test_custom_aoi_drag_pipeline_and_presets(self) -> None:
+        # Arbitrary dragged observation box (e.g., Seine / Paris corridor)
+        bundle_1, avail, s_date, e_date = run_aoi_timeframe_pipeline(
+            south=48.78,
+            west=2.24,
+            north=48.94,
+            east=2.48,
+            label="Custom AOI · Paris",
+            db_path=self.db_path,
+        )
+        self.assertGreaterEqual(len(avail), 4)
+        self.assertEqual(s_date, avail[0])
+        self.assertEqual(e_date, avail[-1])
+        self.assertEqual(bundle_1.newly_inferred, len(avail))
+        self.assertEqual(bundle_1.cache_hits, 0)
+        self.assertGreater(bundle_1.region.pixel_area_km2, 0.0)
+
+        # Presets filter must still return only the 4 curated study areas, excluding dragged AOIs
+        presets = list_regions(self.db_path, presets_only=True)
+        all_regions = list_regions(self.db_path, presets_only=False)
+        self.assertEqual(len(presets), 4)
+        self.assertEqual(len(all_regions), 5)
+
+        # Second call with identical bounds hits SQLite cache cleanly
+        bundle_2, _, _, _ = run_aoi_timeframe_pipeline(
+            south=48.78,
+            west=2.24,
+            north=48.94,
+            east=2.48,
+            label="Custom AOI · Paris",
+            db_path=self.db_path,
+        )
+        self.assertEqual(bundle_2.region.region_id, bundle_1.region.region_id)
+        self.assertEqual(bundle_2.newly_inferred, 0)
+        self.assertEqual(bundle_2.cache_hits, len(avail))
+
+        # World-coordinate consistency: shifting box east by half width keeps overlapping terrain coherent
+        bundle_shifted, _, _, _ = run_aoi_timeframe_pipeline(
+            south=48.78,
+            west=2.36,
+            north=48.94,
+            east=2.60,
+            label="Custom AOI · Paris East",
+            db_path=self.db_path,
+        )
+        hh_a = bundle_1.frames[0].scene.hh_db
+        hh_b = bundle_shifted.frames[0].scene.hh_db
+        half_cols = min(hh_a.shape[1], hh_b.shape[1]) // 2
+        corr = float(np.corrcoef(hh_a[:, -half_cols:].ravel(), hh_b[:, :half_cols].ravel())[0, 1])
+        self.assertGreater(corr, 0.7)
+
+    def test_encode_bundle_for_frontend(self) -> None:
+        presets = list_regions(self.db_path, presets_only=True)
+        preset = presets[0]
+        bundle, avail, s_date, e_date = run_aoi_timeframe_pipeline(
+            south=preset.south,
+            west=preset.west,
+            north=preset.north,
+            east=preset.east,
+            label=preset.name,
+            db_path=self.db_path,
+        )
+        payload = encode_bundle_for_frontend(
+            bundle=bundle,
+            available_dates=avail,
+            selected_elements=[1, 2],
+            view_mode="elements",
+            sar_band="HH",
+            opacity=0.78,
+            show_graph=False,
+            presets=presets,
+            start_date=s_date,
+            end_date=e_date,
+            db_path=self.db_path,
+        )
+        self.assertEqual(len(payload["presets"]), 4)
+        self.assertEqual(payload["selected_elements"], [1, 2])
+        self.assertFalse(payload["show_graph"])
+        self.assertGreater(payload["region"]["width_km"], 0.0)
+        self.assertGreater(payload["region"]["height_km"], 0.0)
+        self.assertAlmostEqual(payload["region"]["south"], preset.south, places=4)
+        self.assertAlmostEqual(payload["region"]["east"], preset.east, places=4)
+        self.assertEqual(len(payload["frames"]), len(bundle.frames))
+
+        first_frame = payload["frames"][0]
+        expected_len = first_frame["rows"] * first_frame["cols"]
+        self.assertEqual(len(base64.b64decode(first_frame["mask_b64"])), expected_len)
+        self.assertEqual(len(base64.b64decode(first_frame["hh_b64"])), expected_len)
+        self.assertEqual(len(base64.b64decode(first_frame["hv_b64"])), expected_len)
+
+    def test_resolution_scaling_and_elevation_mode(self) -> None:
+        b_fine, _, _, _ = run_aoi_timeframe_pipeline(
+            south=48.95,
+            west=8.35,
+            north=49.10,
+            east=8.55,
+            resolution_m=30.0,
+            label="AOI Fine",
+            db_path=self.db_path,
+        )
+        b_coarse, avail_c, s_d, e_d = run_aoi_timeframe_pipeline(
+            south=48.95,
+            west=8.35,
+            north=49.10,
+            east=8.55,
+            resolution_m=150.0,
+            label="AOI Coarse",
+            db_path=self.db_path,
+        )
+        self.assertGreater(
+            b_fine.frames[0].scene.hh_db.shape[0],
+            b_coarse.frames[0].scene.hh_db.shape[0],
+        )
+        self.assertGreater(b_coarse.region.pixel_area_km2, b_fine.region.pixel_area_km2)
+
+        presets = list_regions(self.db_path, presets_only=True)
+        elev_payload = encode_bundle_for_frontend(
+            bundle=b_coarse,
+            available_dates=avail_c,
+            selected_elements=[1, 2],
+            view_mode="elevation_m",
+            sar_band="False-Color Dual-Pol (HH/HV)",
+            opacity=0.8,
+            show_graph=False,
+            presets=presets,
+            start_date=s_d,
+            end_date=e_d,
+            db_path=self.db_path,
+        )
+        self.assertIsNotNone(elev_payload["static_layer_b64"])
+        self.assertEqual(elev_payload["active_layer"]["mode_id"], "elevation_m")
+        self.assertEqual(elev_payload["region"]["resolution_m"], 150.0)
+        static_bytes = base64.b64decode(elev_payload["static_layer_b64"])
+        expected_px = elev_payload["region"]["grid_rows"] * elev_payload["region"]["grid_cols"]
+        self.assertEqual(len(static_bytes), expected_px)
+
+        elev_map = get_layer_grids_for_region(b_coarse.region.region_id, "elevation_m", db_path=self.db_path)
+        rgba = build_rgba_overlay(
+            b_coarse.frames[0], [1, 2], view_mode="elevation_m", layer_grid=elev_map["static"]
+        )
+        self.assertEqual(rgba.shape[2], 4)
+
+    def test_import_processed_nasa_netcdf_run(self) -> None:
+        import pandas as pd
+        import rioxarray  # noqa: F401
+        import xarray as xr
+
+        processed_root = Path(self._tmpdir.name) / "processed"
+        run_dir = processed_root / "oberrhein_unit"
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create 60x60 UTM 32632 grid at 60m resolution in Upper Rhine Valley
+        res_m = 60.0
+        xs = 450000.0 + np.arange(60, dtype=np.float64) * res_m + res_m * 0.5
+        ys = 5445000.0 - np.arange(60, dtype=np.float64) * res_m - res_m * 0.5
+        yy, xx = np.meshgrid(np.linspace(0, 1, 60), np.linspace(0, 1, 60), indexing="ij")
+
+        def _geo_da(arr: np.ndarray, time_val=None):
+            if time_val is not None:
+                da = xr.DataArray(
+                    arr.astype("float32"),
+                    coords={"time": [pd.Timestamp(time_val)], "y": ys, "x": xs},
+                    dims=("time", "y", "x"),
+                )
+            else:
+                da = xr.DataArray(arr.astype("float32"), coords={"y": ys, "x": xs}, dims=("y", "x"))
+            return da.rio.write_crs("EPSG:32632").rio.set_spatial_dims(x_dim="x", y_dim="y")
+
+        elev = (85.0 + 140.0 * xx + 25.0 * np.sin(yy * 4.0)).astype("float32")
+        slope = np.full_like(elev, 6.5)
+        aspect = np.full_like(elev, 180.0)
+        xr.Dataset(
+            {"elevation_m": _geo_da(elev), "slope_deg": _geo_da(slope), "aspect_deg": _geo_da(aspect)}
+        ).to_netcdf(run_dir / "nasadem_static.nc", engine="h5netcdf")
+
+        vv = np.full((1, 60, 60), -11.5, dtype="float32")
+        vv[0, :, 25:30] = -20.5  # River channel
+        vh = vv - 6.5
+        xr.Dataset(
+            {"VV_dB": _geo_da(vv, "2025-01-02"), "VH_dB": _geo_da(vh, "2025-01-02")}
+        ).to_netcdf(run_dir / "opera_rtc_s1.nc", engine="h5netcdf")
+
+        hhhh = np.full((1, 60, 60), -9.0, dtype="float32")
+        hhhh[0, :, 25:30] = -19.5
+        hvhv = hhhh - 5.5
+        xr.Dataset(
+            {"HHHH_dB": _geo_da(hhhh, "2026-06-17"), "HVHV_dB": _geo_da(hvhv, "2026-06-17")}
+        ).to_netcdf(run_dir / "nisar_gcov.nc", engine="h5netcdf")
+
+        coh = np.full((1, 60, 60), 0.68, dtype="float32")
+        coh[0, :, 25:30] = 0.14
+        xr.Dataset(
+            {"coherence_HH": _geo_da(coh, "2026-06-24")}
+        ).to_netcdf(run_dir / "nisar_gunw.nc", engine="h5netcdf")
+
+        runs = list_processed_runs(processed_root)
+        self.assertEqual(len(runs), 1)
+        self.assertAlmostEqual(runs[0].resolution_m, 60.0, places=1)
+        self.assertEqual(list(runs[0].dates), ["2025-01-02", "2026-06-17", "2026-06-24"])
+
+        rec = import_processed_run_to_db(run_dir, db_path=self.db_path)
+        self.assertEqual(rec.source_type, "nasa_earthdata")
+        self.assertAlmostEqual(rec.resolution_m, 60.0, places=1)
+
+        bundle, avail, s_d, e_d = run_aoi_timeframe_pipeline(
+            south=rec.south,
+            west=rec.west,
+            north=rec.north,
+            east=rec.east,
+            region_id=rec.region_id,
+            db_path=self.db_path,
+        )
+        self.assertEqual(avail, ["2025-01-02", "2026-06-17", "2026-06-24"])
+
+        presets = list_regions(self.db_path, presets_only=True)
+        coh_payload = encode_bundle_for_frontend(
+            bundle=bundle,
+            available_dates=avail,
+            selected_elements=[1, 2],
+            view_mode="coherence_hh",
+            sar_band="False-Color Dual-Pol (HH/HV)",
+            opacity=0.8,
+            show_graph=False,
+            presets=presets,
+            start_date=s_d,
+            end_date=e_d,
+            db_path=self.db_path,
+        )
+        # Coherence was only on 2026-06-24 (frame index 2)
+        self.assertEqual([f["has_layer"] for f in coh_payload["frames"]], [False, False, True])
+
+    def test_multiyear_source_range_and_german_localization(self) -> None:
+        from src.data_source import DEFAULT_WORLD_TIMELINE
+        from src.earthdata_pipeline import get_source_date_limits
+
+        min_d, max_d, per_src = get_source_date_limits()
+        self.assertEqual(min_d, "2016-01-01")
+        self.assertGreaterEqual(max_d, "2026-01-01")
+        self.assertIn("OPERA_L2_RTC-S1_V1", per_src)
+        self.assertIn("NISAR_L2_GCOV_V1", per_src)
+        self.assertGreaterEqual(len(DEFAULT_WORLD_TIMELINE), 12)
+        self.assertTrue(DEFAULT_WORLD_TIMELINE[0][0].startswith("2016-"))
+        self.assertTrue(DEFAULT_WORLD_TIMELINE[-1][0].startswith("2026-"))
+
+        bundle, avail, s_d, e_d = run_aoi_timeframe_pipeline(
+            south=12.40,
+            west=13.55,
+            north=13.50,
+            east=14.95,
+            region_id="lake_chad_shrinking",
+            extend_to_source_history=True,
+            db_path=self.db_path,
+        )
+        self.assertGreaterEqual(len(avail), 12)
+        self.assertTrue(avail[0].startswith("2016-"))
+        self.assertGreaterEqual(len(bundle.frames), 12)
+
+        presets = list_regions(self.db_path, presets_only=True)
+        de_payload = encode_bundle_for_frontend(
+            bundle=bundle,
+            available_dates=avail,
+            selected_elements=[1, 2],
+            view_mode="elevation_m",
+            sar_band="False-Color Dual-Pol (HH/HV)",
+            opacity=0.8,
+            show_graph=True,
+            presets=presets,
+            start_date=s_d,
+            end_date=e_d,
+            lang="de",
+            db_path=self.db_path,
+        )
+        self.assertEqual(de_payload["lang"], "de")
+        self.assertEqual(de_payload["source_limits"]["min_date"], "2016-01-01")
+        self.assertIn("i18n", de_payload)
+        self.assertEqual(de_payload["active_layer"]["label"], "NASADEM Höhe (m)")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 """SQLite database layer for SAR observations, study regions, and neural-network classifications."""
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import zlib
@@ -13,9 +14,25 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 import numpy as np
 from scipy.ndimage import gaussian_filter
 
+from src.data_source import (
+    DEFAULT_WORLD_TIMELINE,
+    WorldLBandDataSource,
+    compute_box_dimensions_km,
+    compute_geodesic_pixel_area_km2,
+    compute_grid_shape,
+    list_default_timeline_dates,
+    synthesize_sar_from_landcover,
+)
+
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "sar_earth.db"
 GRID_ROWS = 144
 GRID_COLS = 144
+PRESET_REGION_IDS = (
+    "elbe_flood",
+    "amazon_deforestation",
+    "sundarbans_mangroves",
+    "sacramento_wetlands",
+)
 
 
 @dataclass(frozen=True)
@@ -34,6 +51,8 @@ class RegionRecord:
     pixel_area_km2: float
     story: str
     data_sources: str
+    resolution_m: float = 30.0
+    source_type: str = "simulated"
 
     @property
     def bounds(self) -> List[List[float]]:
@@ -142,8 +161,25 @@ def init_database(db_path: Path = DEFAULT_DB_PATH, seed_if_empty: bool = True) -
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (scene_id, model_id)
             );
+
+            CREATE TABLE IF NOT EXISTS layer_grids (
+                region_id TEXT NOT NULL REFERENCES regions(region_id),
+                acq_date TEXT NOT NULL,
+                layer_key TEXT NOT NULL,
+                grid_rows INTEGER NOT NULL,
+                grid_cols INTEGER NOT NULL,
+                values_blob BLOB NOT NULL,
+                PRIMARY KEY (region_id, acq_date, layer_key)
+            );
             """
         )
+        # Backwards-compatible migration for pre-existing databases
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(regions)").fetchall()}
+        if "resolution_m" not in cols:
+            conn.execute("ALTER TABLE regions ADD COLUMN resolution_m REAL NOT NULL DEFAULT 30.0")
+        if "source_type" not in cols:
+            conn.execute("ALTER TABLE regions ADD COLUMN source_type TEXT NOT NULL DEFAULT 'simulated'")
+
         row = conn.execute("SELECT COUNT(*) AS cnt FROM regions").fetchone()
         if seed_if_empty and row["cnt"] == 0:
             _seed_demo_data(conn)
@@ -154,46 +190,6 @@ def _smooth_noise(rng: np.random.Generator, shape: Tuple[int, int], sigma: float
     smoothed = gaussian_filter(base, sigma=sigma, mode="reflect")
     std = float(smoothed.std()) or 1.0
     return (smoothed / std).astype(np.float32)
-
-
-def _synthesize_sar_from_landcover(
-    true_classes: np.ndarray,
-    rng: np.random.Generator,
-    moisture_shift_db: float = 0.0,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Convert a spatial land-cover grid into physically realistic dual-pol L-band dB arrays."""
-    h, w = true_classes.shape
-    hh = np.zeros((h, w), dtype=np.float32)
-    hv = np.zeros((h, w), dtype=np.float32)
-
-    # (hh_mu, hh_sig, hv_mu, hv_sig, tex_extra)
-    signatures = {
-        0: (-13.0 + 0.5 * moisture_shift_db, 0.55, -22.2, 0.65, 0.25),
-        1: (-18.5, 0.85, -25.0, 0.80, 0.20),
-        2: (-6.8, 0.65, -11.2, 0.65, 0.70),
-        3: (-4.2 + 0.2 * moisture_shift_db, 0.65, -13.4, 0.65, 0.50),
-        4: (-9.8 + 0.7 * moisture_shift_db, 0.65, -16.8 + 0.3 * moisture_shift_db, 0.65, 0.35),
-        5: (-0.4, 0.90, -11.5, 0.95, 1.95),
-    }
-
-    for cid, (hh_mu, hh_sig, hv_mu, hv_sig, tex) in signatures.items():
-        mask = true_classes == cid
-        n = int(np.sum(mask))
-        if n == 0:
-            continue
-        hh_vals = rng.normal(hh_mu, hh_sig, size=n).astype(np.float32)
-        hv_vals = rng.normal(hv_mu, hv_sig, size=n).astype(np.float32)
-        if tex > 0.4:
-            spikes = rng.normal(0.0, tex, size=n).astype(np.float32)
-            hh_vals += spikes
-            hv_vals += 0.45 * spikes
-        hh[mask] = hh_vals
-        hv[mask] = hv_vals
-
-    # Slight spatial correlation mimics multi-looked SAR impulse response
-    hh = gaussian_filter(hh, sigma=0.45, mode="reflect")
-    hv = gaussian_filter(hv, sigma=0.45, mode="reflect")
-    return hh.astype(np.float32), hv.astype(np.float32)
 
 
 def _build_elbe_frames(
@@ -562,7 +558,7 @@ def _seed_demo_data(conn: sqlite3.Connection) -> None:
         )
 
         for idx, (acq_date, moisture, cloud_pct, note, true_cls) in enumerate(frames):
-            hh_db, hv_db = _synthesize_sar_from_landcover(true_cls, rng, moisture_shift_db=moisture)
+            hh_db, hv_db = synthesize_sar_from_landcover(true_cls, rng, moisture_shift_db=moisture)
             scene_id = f"{region_id}_{acq_date.replace('-', '')}"
             orbit = "Ascending" if idx % 2 == 0 else "Descending"
             conn.execute(
@@ -591,11 +587,458 @@ def _seed_demo_data(conn: sqlite3.Connection) -> None:
             )
 
 
-def list_regions(db_path: Path = DEFAULT_DB_PATH) -> List[RegionRecord]:
+def list_regions(db_path: Path = DEFAULT_DB_PATH, presets_only: bool = False) -> List[RegionRecord]:
     init_database(db_path)
     with get_connection(db_path) as conn:
-        rows = conn.execute("SELECT * FROM regions ORDER BY name").fetchall()
+        if presets_only:
+            placeholders = ",".join("?" for _ in PRESET_REGION_IDS)
+            rows = conn.execute(
+                f"SELECT * FROM regions WHERE region_id IN ({placeholders}) ORDER BY name",
+                PRESET_REGION_IDS,
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM regions ORDER BY name").fetchall()
     return [RegionRecord(**dict(r)) for r in rows]
+
+
+def _upsert_layer_grid(
+    conn: sqlite3.Connection,
+    region_id: str,
+    acq_date: str,
+    layer_key: str,
+    arr: np.ndarray,
+) -> None:
+    rows, cols = arr.shape
+    conn.execute(
+        """
+        INSERT INTO layer_grids (region_id, acq_date, layer_key, grid_rows, grid_cols, values_blob)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(region_id, acq_date, layer_key) DO UPDATE SET
+            grid_rows = excluded.grid_rows,
+            grid_cols = excluded.grid_cols,
+            values_blob = excluded.values_blob
+        """,
+        (region_id, acq_date, layer_key, rows, cols, _encode_array(arr, np.float32)),
+    )
+
+
+def ensure_auxiliary_layers_for_region(region: RegionRecord, db_path: Path = DEFAULT_DB_PATH) -> None:
+    """Populate static & multi-sensor layers for curated presets if not yet materialized."""
+    with get_connection(db_path) as conn:
+        cnt = conn.execute(
+            "SELECT COUNT(*) FROM layer_grids WHERE region_id = ?", (region.region_id,)
+        ).fetchone()[0]
+        if cnt > 0:
+            return
+
+        scenes = conn.execute(
+            "SELECT acq_date, grid_rows, grid_cols, hh_db_blob, hv_db_blob FROM sar_scenes WHERE region_id = ? ORDER BY acq_date",
+            (region.region_id,),
+        ).fetchall()
+        if not scenes:
+            return
+
+        r0, c0 = int(scenes[0]["grid_rows"]), int(scenes[0]["grid_cols"])
+        src = WorldLBandDataSource()
+        static_terrain = src.fetch_static_terrain(
+            region.south, region.west, region.north, region.east, r0, c0, region.resolution_m
+        )
+        for key, arr in static_terrain.items():
+            _upsert_layer_grid(conn, region.region_id, "static", key, arr)
+
+        for row in scenes:
+            shape = (int(row["grid_rows"]), int(row["grid_cols"]))
+            hh = _decode_array(row["hh_db_blob"], shape, np.float32)
+            hv = _decode_array(row["hv_db_blob"], shape, np.float32)
+            seed_bytes = hashlib.sha256(f"{region.region_id}_{row['acq_date']}".encode()).digest()
+            rng = np.random.default_rng(int.from_bytes(seed_bytes[:8], "little"))
+
+            vv_db = (hh - 0.8 + rng.normal(0.0, 0.4, size=shape)).astype(np.float32)
+            vh_db = (hv - 1.1 + rng.normal(0.0, 0.4, size=shape)).astype(np.float32)
+            vh_vv = (vh_db - vv_db).astype(np.float32)
+            # Physics-grounded coherence: low for smooth specular water (very low hh) & canopy, high for urban (bright hh)
+            coh = np.clip(0.55 + 0.03 * hh - 0.015 * np.maximum(hv + 18.0, 0.0), 0.06, 0.96)
+            coh = gaussian_filter(coh.astype(np.float32), sigma=0.75, mode="reflect").astype(np.float32)
+            dswx = np.where(hh < -15.2, 1.0, np.where((hh > -6.0) & (hh - hv > 7.5), 2.0, 0.0)).astype(np.float32)
+
+            dt = row["acq_date"]
+            _upsert_layer_grid(conn, region.region_id, dt, "opera_vv_db", vv_db)
+            _upsert_layer_grid(conn, region.region_id, dt, "opera_vh_db", vh_db)
+            _upsert_layer_grid(conn, region.region_id, dt, "opera_vh_vv_db", vh_vv)
+            _upsert_layer_grid(conn, region.region_id, dt, "opera_dswx_wtr", dswx)
+            _upsert_layer_grid(conn, region.region_id, dt, "nisar_hhhh_db", hh)
+            _upsert_layer_grid(conn, region.region_id, dt, "nisar_hvhv_db", hv)
+            _upsert_layer_grid(conn, region.region_id, dt, "coherence_hh", coh)
+
+
+def ensure_multiyear_dates_for_region(region: RegionRecord, db_path: Path = DEFAULT_DB_PATH) -> None:
+    """Backfill full 2016–2026 Sentinel-1 OPERA + NISAR span for simulated regions on demand."""
+    if region.source_type != "simulated":
+        return
+
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT scene_id, acq_date, grid_rows, grid_cols, hh_db_blob, hv_db_blob
+            FROM sar_scenes
+            WHERE region_id = ?
+            ORDER BY acq_date ASC
+            """,
+            (region.region_id,),
+        ).fetchall()
+        if not rows:
+            return
+
+        existing_dates = {str(r["acq_date"]) for r in rows}
+        min_existing = min(existing_dates)
+        max_existing = max(existing_dates)
+        if min_existing <= "2016-12-31":
+            return
+
+        r0, c0 = int(rows[0]["grid_rows"]), int(rows[0]["grid_cols"])
+        shape = (r0, c0)
+
+        # Decode dryest & wettest seeded frames for geometry-preserving seasonal interpolation
+        decoded_scenes: List[Tuple[float, np.ndarray, np.ndarray]] = []
+        for r in rows:
+            hh_arr = _decode_array(r["hh_db_blob"], shape, np.float32)
+            hv_arr = _decode_array(r["hv_db_blob"], shape, np.float32)
+            water_frac = float(np.mean(hh_arr < -15.0))
+            decoded_scenes.append((water_frac, hh_arr, hv_arr))
+        decoded_scenes.sort(key=lambda item: item[0])
+        _, hh_dry, hv_dry = decoded_scenes[0]
+        _, hh_wet, hv_wet = decoded_scenes[-1]
+
+        src = WorldLBandDataSource()
+        for idx, (acq_date, stage, cloud_pct, note) in enumerate(DEFAULT_WORLD_TIMELINE):
+            if acq_date in existing_dates:
+                continue
+            # Keep curated 2026 preset peaks intact; backfill years before & after preset window
+            if min_existing <= acq_date <= max_existing:
+                continue
+
+            if region.region_id.startswith("aoi_"):
+                hh_new, hv_new, cloud_pct, note, aux = src.fetch_temporal_layers(
+                    region.south, region.west, region.north, region.east, acq_date, grid_rows=r0, grid_cols=c0
+                )
+            else:
+                seed_bytes = hashlib.sha256(f"{region.region_id}_{acq_date}".encode()).digest()
+                rng = np.random.default_rng(int.from_bytes(seed_bytes[:8], "little"))
+                alpha = float(np.clip((stage - 0.11) / 0.30, 0.02, 0.96))
+                noise_hh = gaussian_filter(rng.normal(0.0, 0.45, size=shape).astype(np.float32), sigma=0.55)
+                noise_hv = gaussian_filter(rng.normal(0.0, 0.45, size=shape).astype(np.float32), sigma=0.55)
+                hh_new = ((1.0 - alpha) * hh_dry + alpha * hh_wet + noise_hh).astype(np.float32)
+                hv_new = ((1.0 - alpha) * hv_dry + alpha * hv_wet + noise_hv).astype(np.float32)
+                vv_db = (hh_new - 0.8 + rng.normal(0.0, 0.35, size=shape)).astype(np.float32)
+                vh_db = (hv_new - 1.1 + rng.normal(0.0, 0.35, size=shape)).astype(np.float32)
+                vh_vv = (vh_db - vv_db).astype(np.float32)
+                coh = np.clip(0.55 + 0.03 * hh_new - 0.015 * np.maximum(hv_new + 18.0, 0.0), 0.06, 0.96)
+                coh = gaussian_filter(coh.astype(np.float32), sigma=0.75, mode="reflect").astype(np.float32)
+                dswx = np.where(
+                    hh_new < -15.2, 1.0, np.where((hh_new > -6.0) & (hh_new - hv_new > 7.5), 2.0, 0.0)
+                ).astype(np.float32)
+                aux = {
+                    "opera_vv_db": vv_db,
+                    "opera_vh_db": vh_db,
+                    "opera_vh_vv_db": vh_vv,
+                    "opera_dswx_wtr": dswx,
+                    "nisar_hhhh_db": hh_new,
+                    "nisar_hvhv_db": hv_new,
+                    "coherence_hh": coh,
+                }
+
+            sensor = "NISAR L-SAR" if acq_date >= "2025-11-01" else "OPERA RTC-S1 C-SAR"
+            pols = "HH / HV" if acq_date >= "2025-11-01" else "VV / VH"
+            scene_id = f"{region.region_id}_{acq_date.replace('-', '')}"
+            orbit = "Ascending" if idx % 2 == 0 else "Descending"
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO sar_scenes (
+                    scene_id, region_id, acq_date, sensor, orbit_direction,
+                    polarizations, resolution_m, cloud_cover_optical_pct,
+                    grid_rows, grid_cols, hh_db_blob, hv_db_blob, event_note
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    scene_id,
+                    region.region_id,
+                    acq_date,
+                    sensor,
+                    orbit,
+                    pols,
+                    region.resolution_m,
+                    cloud_pct,
+                    r0,
+                    c0,
+                    _encode_array(hh_new, np.float32),
+                    _encode_array(hv_new, np.float32),
+                    note,
+                ),
+            )
+            for lkey, larr in aux.items():
+                _upsert_layer_grid(conn, region.region_id, acq_date, lkey, larr)
+
+
+def list_region_layer_keys(region_id: str, db_path: Path = DEFAULT_DB_PATH) -> List[str]:
+    """Return sorted distinct auxiliary `layer_key` names stored for `region_id`."""
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT layer_key FROM layer_grids WHERE region_id = ? ORDER BY layer_key",
+            (region_id,),
+        ).fetchall()
+    return [str(r["layer_key"]) for r in rows]
+
+
+def get_layer_grids_for_region(
+    region_id: str,
+    layer_key: str,
+    db_path: Path = DEFAULT_DB_PATH,
+) -> Dict[str, np.ndarray]:
+    """Load `{acq_date_or_static: float32_2d_array}` for a given region & `layer_key`."""
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT acq_date, grid_rows, grid_cols, values_blob
+            FROM layer_grids
+            WHERE region_id = ? AND layer_key = ?
+            """,
+            (region_id, layer_key),
+        ).fetchall()
+    return {
+        str(r["acq_date"]): _decode_array(r["values_blob"], (int(r["grid_rows"]), int(r["grid_cols"])), np.float32)
+        for r in rows
+    }
+
+
+def ensure_custom_aoi_region(
+    south: float,
+    west: float,
+    north: float,
+    east: float,
+    resolution_m: float = 30.0,
+    label: Optional[str] = None,
+    db_path: Path = DEFAULT_DB_PATH,
+) -> RegionRecord:
+    """
+    Resolve an arbitrary dragged/resized observation box `(south, west, north, east)`
+    at target `resolution_m` to an existing preset or persist a custom AOI in SQLite.
+    """
+    init_database(db_path)
+    s_in, n_in = sorted([float(south), float(north)])
+    w_in, e_in = sorted([float(west), float(east)])
+    s, n = max(-84.0, round(s_in, 4)), min(84.0, round(n_in, 4))
+    w, e = max(-179.9, round(w_in, 4)), min(179.9, round(e_in, 4))
+    if n - s < 0.005:
+        n = min(84.0, s + 0.005)
+    if e - w < 0.005:
+        e = min(179.9, w + 0.005)
+
+    res_m = max(10.0, round(float(resolution_m), 1))
+
+    # Match curated presets at default 30m resolution cleanly
+    if abs(res_m - 30.0) < 0.5:
+        for preset in list_regions(db_path, presets_only=True):
+            if (
+                abs(preset.south - s) < 2e-3
+                and abs(preset.west - w) < 2e-3
+                and abs(preset.north - n) < 2e-3
+                and abs(preset.east - e) < 2e-3
+            ):
+                ensure_auxiliary_layers_for_region(preset, db_path=db_path)
+                return preset
+
+    bbox_key = f"{s:.4f},{w:.4f},{n:.4f},{e:.4f}"
+    digest = hashlib.sha1(bbox_key.encode()).hexdigest()[:10]
+    region_id = f"aoi_{digest}" if abs(res_m - 30.0) < 0.5 else f"aoi_{digest}_{int(round(res_m))}m"
+
+    with get_connection(db_path) as conn:
+        existing = conn.execute(
+            "SELECT * FROM regions WHERE region_id = ?", (region_id,)
+        ).fetchone()
+        if existing is not None:
+            rec = RegionRecord(**dict(existing))
+            ensure_auxiliary_layers_for_region(rec, db_path=db_path)
+            return rec
+
+        center_lat = round(0.5 * (s + n), 4)
+        center_lon = round(0.5 * (w + e), 4)
+        clean_label = (label or "").strip() or f"Custom Observation ({center_lat:.2f}°, {center_lon:.2f}°)"
+        rows, cols = compute_grid_shape(s, w, n, e, resolution_m=res_m, max_dim=224, min_dim=48)
+        px_km2 = compute_geodesic_pixel_area_km2(s, w, n, e, rows, cols)
+
+        conn.execute(
+            """
+            INSERT INTO regions (
+                region_id, name, country, phenomenon,
+                center_lat, center_lon, zoom_start,
+                south, west, north, east, pixel_area_km2,
+                story, data_sources, resolution_m, source_type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                region_id,
+                clean_label,
+                "Custom AOI",
+                "Interactive Area-of-Interest Analysis",
+                center_lat,
+                center_lon,
+                12,
+                s,
+                w,
+                n,
+                e,
+                px_km2,
+                (
+                    f"Dynamic multi-sensor & neural-network inference over bounding box "
+                    f"[{s:.3f}, {w:.3f}] to [{n:.3f}, {e:.3f}] @ {res_m:.0f}m target spacing."
+                ),
+                f"Interactive AOI @ {res_m:.0f}m · Multi-Sensor Model (Ready for NASA Earthdata Fetch)",
+                res_m,
+                "simulated",
+            ),
+        )
+
+        source = WorldLBandDataSource()
+        static_terrain = source.fetch_static_terrain(s, w, n, e, rows, cols, res_m)
+        for key, arr in static_terrain.items():
+            _upsert_layer_grid(conn, region_id, "static", key, arr)
+
+        for idx, acq_date in enumerate(list_default_timeline_dates()):
+            hh_db, hv_db, cloud_pct, note, aux = source.fetch_temporal_layers(
+                s, w, n, e, acq_date, grid_rows=rows, grid_cols=cols
+            )
+            scene_id = f"{region_id}_{acq_date.replace('-', '')}"
+            orbit = "Ascending" if idx % 2 == 0 else "Descending"
+            conn.execute(
+                """
+                INSERT INTO sar_scenes (
+                    scene_id, region_id, acq_date, sensor, orbit_direction,
+                    polarizations, resolution_m, cloud_cover_optical_pct,
+                    grid_rows, grid_cols, hh_db_blob, hv_db_blob, event_note
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    scene_id,
+                    region_id,
+                    acq_date,
+                    "NISAR L-SAR",
+                    orbit,
+                    "HH / HV",
+                    res_m,
+                    cloud_pct,
+                    rows,
+                    cols,
+                    _encode_array(hh_db, np.float32),
+                    _encode_array(hv_db, np.float32),
+                    note,
+                ),
+            )
+            for lkey, larr in aux.items():
+                _upsert_layer_grid(conn, region_id, acq_date, lkey, larr)
+
+        saved = conn.execute(
+            "SELECT * FROM regions WHERE region_id = ?", (region_id,)
+        ).fetchone()
+    return RegionRecord(**dict(saved))
+
+
+def import_processed_run_to_db(
+    run_dir: Path,
+    region_name: Optional[str] = None,
+    db_path: Path = DEFAULT_DB_PATH,
+) -> RegionRecord:
+    """Ingest a real NASA Earthdata `data/processed/<run_name>/` NetCDF run into SQLite."""
+    from src.earthdata_pipeline import load_processed_run_for_db
+
+    init_database(db_path)
+    bundle_data = load_processed_run_for_db(run_dir)
+    run_name = bundle_data["run_name"]
+    region_id = f"nasa_{run_name}"
+
+    s, w, n, e = bundle_data["south"], bundle_data["west"], bundle_data["north"], bundle_data["east"]
+    rows, cols = bundle_data["rows"], bundle_data["cols"]
+    res_m = bundle_data["resolution_m"]
+    center_lat = round(0.5 * (s + n), 4)
+    center_lon = round(0.5 * (w + e), 4)
+    px_km2 = compute_geodesic_pixel_area_km2(s, w, n, e, rows, cols)
+    w_km, h_km = compute_box_dimensions_km(s, w, n, e)
+    display_name = (region_name or "").strip() or f"NASA Earthdata · {run_name}"
+    ds_label = ", ".join(bundle_data["datasets"])
+
+    with get_connection(db_path) as conn:
+        # Remove prior state for this run_id so re-downloads replace cleanly
+        conn.execute(
+            "DELETE FROM model_classifications WHERE scene_id IN (SELECT scene_id FROM sar_scenes WHERE region_id = ?)",
+            (region_id,),
+        )
+        conn.execute("DELETE FROM layer_grids WHERE region_id = ?", (region_id,))
+        conn.execute("DELETE FROM sar_scenes WHERE region_id = ?", (region_id,))
+        conn.execute("DELETE FROM regions WHERE region_id = ?", (region_id,))
+
+        conn.execute(
+            """
+            INSERT INTO regions (
+                region_id, name, country, phenomenon,
+                center_lat, center_lon, zoom_start,
+                south, west, north, east, pixel_area_km2,
+                story, data_sources, resolution_m, source_type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                region_id,
+                display_name,
+                f"NASA Earthdata ({w_km:.1f}×{h_km:.1f} km)",
+                "Aligned NASA Multi-Sensor Archive",
+                center_lat,
+                center_lon,
+                12,
+                s,
+                w,
+                n,
+                e,
+                px_km2,
+                f"Imported aligned NetCDF-4 cubes ({ds_label}) @ {res_m:.0f}m UTM spacing.",
+                f"NASA Earthdata ({ds_label}) @ {res_m:.0f}m",
+                res_m,
+                "nasa_earthdata",
+            ),
+        )
+
+        for key, arr in bundle_data["static_layers"].items():
+            _upsert_layer_grid(conn, region_id, "static", key, arr)
+
+        for idx, rec in enumerate(bundle_data["timeline"]):
+            dt = rec["acq_date"]
+            scene_id = f"{region_id}_{dt.replace('-', '')}"
+            conn.execute(
+                """
+                INSERT INTO sar_scenes (
+                    scene_id, region_id, acq_date, sensor, orbit_direction,
+                    polarizations, resolution_m, cloud_cover_optical_pct,
+                    grid_rows, grid_cols, hh_db_blob, hv_db_blob, event_note
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    scene_id,
+                    region_id,
+                    dt,
+                    rec["sensor"],
+                    "Ascending" if idx % 2 == 0 else "Descending",
+                    rec["polarizations"],
+                    res_m,
+                    0.0,
+                    rows,
+                    cols,
+                    _encode_array(rec["hh_db"], np.float32),
+                    _encode_array(rec["hv_db"], np.float32),
+                    rec["event_note"],
+                ),
+            )
+            for lkey, larr in rec["aux_layers"].items():
+                _upsert_layer_grid(conn, region_id, dt, lkey, larr)
+
+        saved = conn.execute("SELECT * FROM regions WHERE region_id = ?", (region_id,)).fetchone()
+    return RegionRecord(**dict(saved))
 
 
 def get_region(region_id: str, db_path: Path = DEFAULT_DB_PATH) -> RegionRecord:
